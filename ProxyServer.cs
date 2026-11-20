@@ -33,17 +33,30 @@ public sealed class ProxyServer
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        var listener = new TcpListener(_bindAddress, _port);
-        listener.Start();
-
-        cancellationToken.Register(() => listener.Stop());
-
         while (!cancellationToken.IsCancellationRequested)
         {
+            TcpListener? listener = null;
+            CancellationTokenRegistration registration = default;
             try
             {
-                var clientSocket = await listener.AcceptSocketAsync(cancellationToken);
-                _ = HandleConnectionAsync(clientSocket, cancellationToken);
+                listener = new TcpListener(_bindAddress, _port);
+                listener.Start();
+                registration = cancellationToken.Register(() =>
+                {
+                    try
+                    {
+                        listener.Stop();
+                    }
+                    catch
+                    {
+                    }
+                });
+
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var clientSocket = await listener.AcceptSocketAsync(cancellationToken);
+                    _ = HandleConnectionAsync(clientSocket, cancellationToken);
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -53,52 +66,69 @@ public sealed class ProxyServer
             {
                 if (cancellationToken.IsCancellationRequested)
                     break;
+
+                try
+                {
+                    await Task.Delay(500, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
+            finally
+            {
+                registration.Dispose();
+                try
+                {
+                    listener?.Dispose();
+                }
+                catch
+                {
+                }
             }
         }
     }
 
     private async Task HandleConnectionAsync(Socket clientSocket, CancellationToken cancellationToken)
     {
-        using (clientSocket)
+        try
         {
-            ConfigureSocket(clientSocket);
-            using var rawStream = new NetworkStream(clientSocket, true);
-            using var clientStream = new CountingWriterStream(rawStream);
-            using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            handshakeCts.CancelAfter(_timeout);
+            using (clientSocket)
+            {
+                ConfigureSocket(clientSocket);
+                using var rawStream = new NetworkStream(clientSocket, true);
+                using var clientStream = new CountingWriterStream(rawStream);
+                using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                handshakeCts.CancelAfter(_timeout);
 
-            var peekBuffer = new byte[1024];
-            var bytesRead = 0;
-            try
-            {
-                bytesRead = await clientStream.ReadAsync(peekBuffer.AsMemory(0, peekBuffer.Length), handshakeCts.Token);
-            }
-            catch
-            {
-                return;
-            }
+                var peekBuffer = new byte[1024];
+                var bytesRead = await clientStream.ReadAsync(peekBuffer.AsMemory(0, peekBuffer.Length), handshakeCts.Token);
+                if (bytesRead == 0)
+                    return;
 
-            if (bytesRead == 0)
-                return;
-
-            var firstByte = peekBuffer[0];
-            if (firstByte == 0x05)
-                await HandleSocks5Async(clientStream, peekBuffer, bytesRead, cancellationToken);
-            else if (firstByte == 0x04)
-            {
-                using var combinedStream = new PrefixedStream(clientStream, peekBuffer, bytesRead, true);
-                await HandleSocks4Async(combinedStream, clientStream, cancellationToken);
+                var firstByte = peekBuffer[0];
+                if (firstByte == 0x05)
+                    await HandleSocks5Async(clientStream, peekBuffer, bytesRead, cancellationToken);
+                else if (firstByte == 0x04)
+                {
+                    using var combinedStream = new PrefixedStream(clientStream, peekBuffer, bytesRead, true);
+                    await HandleSocks4Async(combinedStream, clientStream, cancellationToken);
+                }
+                else if (firstByte == 0x16 && bytesRead >= 3 && peekBuffer[1] == 0x03)
+                {
+                    using var combinedStream = new PrefixedStream(clientStream, peekBuffer, bytesRead, true);
+                    await HandleHttpsSniAsync(combinedStream, clientStream, peekBuffer, bytesRead, cancellationToken);
+                }
+                else
+                {
+                    using var combinedStream = new PrefixedStream(clientStream, peekBuffer, bytesRead, true);
+                    await HandleHttpAsync(combinedStream, clientStream, cancellationToken);
+                }
             }
-            else if (firstByte == 0x16 && bytesRead >= 3 && peekBuffer[1] == 0x03)
-            {
-                using var combinedStream = new PrefixedStream(clientStream, peekBuffer, bytesRead, true);
-                await HandleHttpsSniAsync(combinedStream, clientStream, peekBuffer, bytesRead, cancellationToken);
-            }
-            else
-            {
-                using var combinedStream = new PrefixedStream(clientStream, peekBuffer, bytesRead, true);
-                await HandleHttpAsync(combinedStream, clientStream, cancellationToken);
-            }
+        }
+        catch (Exception)
+        {
         }
     }
 
@@ -516,40 +546,60 @@ public sealed class ProxyServer
         if (_upstreamProxy == null)
         {
             var tcpClient = new TcpClient();
-            ConfigureSocket(tcpClient.Client);
-            await tcpClient.ConnectAsync(targetHost, targetPort, connectCts.Token);
-            return tcpClient.GetStream();
+            try
+            {
+                ConfigureSocket(tcpClient.Client);
+                await tcpClient.ConnectAsync(targetHost, targetPort, connectCts.Token);
+                return tcpClient.GetStream();
+            }
+            catch
+            {
+                tcpClient.Dispose();
+                throw;
+            }
         }
 
         var proxyTcp = new TcpClient();
-        ConfigureSocket(proxyTcp.Client);
-        await proxyTcp.ConnectAsync(_upstreamProxy.Host, _upstreamProxy.Port, connectCts.Token);
-        var baseStream = proxyTcp.GetStream();
-
-        if (string.Equals(_upstreamProxy.Scheme, "socks5", StringComparison.OrdinalIgnoreCase))
-            return await UpstreamSocks5ConnectAsync(baseStream, _upstreamProxy, targetHost, targetPort, connectCts.Token);
-
-        if (string.Equals(_upstreamProxy.Scheme, "socks4", StringComparison.OrdinalIgnoreCase))
-            return await UpstreamSocks4ConnectAsync(baseStream, targetHost, targetPort, connectCts.Token);
-
-        if (string.Equals(_upstreamProxy.Scheme, "https", StringComparison.OrdinalIgnoreCase))
+        NetworkStream? baseStream = null;
+        SslStream? sslStream = null;
+        try
         {
-            var sslOptions = new SslClientAuthenticationOptions
-            {
-                TargetHost = _upstreamProxy.Host,
-                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
-            };
-            if (_insecure)
-            {
-                sslOptions.RemoteCertificateValidationCallback = (sender, cert, chain, errors) => true;
-                sslOptions.CertificateRevocationCheckMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck;
-            }
-            var sslStream = new SslStream(baseStream, false, _insecure ? (sender, cert, chain, errors) => true : null);
-            await sslStream.AuthenticateAsClientAsync(sslOptions, connectCts.Token);
-            return await UpstreamHttpConnectAsync(sslStream, _upstreamProxy, targetHost, targetPort, connectCts.Token);
-        }
+            ConfigureSocket(proxyTcp.Client);
+            await proxyTcp.ConnectAsync(_upstreamProxy.Host, _upstreamProxy.Port, connectCts.Token);
+            baseStream = proxyTcp.GetStream();
 
-        return await UpstreamHttpConnectAsync(baseStream, _upstreamProxy, targetHost, targetPort, connectCts.Token);
+            if (string.Equals(_upstreamProxy.Scheme, "socks5", StringComparison.OrdinalIgnoreCase))
+                return await UpstreamSocks5ConnectAsync(baseStream, _upstreamProxy, targetHost, targetPort, connectCts.Token);
+
+            if (string.Equals(_upstreamProxy.Scheme, "socks4", StringComparison.OrdinalIgnoreCase))
+                return await UpstreamSocks4ConnectAsync(baseStream, targetHost, targetPort, connectCts.Token);
+
+            if (string.Equals(_upstreamProxy.Scheme, "https", StringComparison.OrdinalIgnoreCase))
+            {
+                var sslOptions = new SslClientAuthenticationOptions
+                {
+                    TargetHost = _upstreamProxy.Host,
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
+                };
+                if (_insecure)
+                {
+                    sslOptions.RemoteCertificateValidationCallback = (sender, cert, chain, errors) => true;
+                    sslOptions.CertificateRevocationCheckMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck;
+                }
+                sslStream = new SslStream(baseStream, false);
+                await sslStream.AuthenticateAsClientAsync(sslOptions, connectCts.Token);
+                return await UpstreamHttpConnectAsync(sslStream, _upstreamProxy, targetHost, targetPort, connectCts.Token);
+            }
+
+            return await UpstreamHttpConnectAsync(baseStream, _upstreamProxy, targetHost, targetPort, connectCts.Token);
+        }
+        catch
+        {
+            sslStream?.Dispose();
+            baseStream?.Dispose();
+            proxyTcp.Dispose();
+            throw;
+        }
     }
 
     private static async Task<Stream> UpstreamSocks5ConnectAsync(Stream stream, UpstreamProxy proxy, string targetHost, int targetPort, CancellationToken cancellationToken)
@@ -750,52 +800,79 @@ public sealed class ProxyServer
 
         void OnActivity() => Interlocked.Exchange(ref lastActivity, Environment.TickCount64);
 
-        _ = Task.Run(async () =>
+        var checkInterval = (int)Math.Clamp(timeoutMs / 4, 100L, 1000L);
+        var watchdogTask = Task.Run(async () =>
         {
-            var checkInterval = Math.Min(1000, Math.Max(100, (int)(timeoutMs / 4)));
             while (!sessionCts.IsCancellationRequested)
             {
                 try
                 {
                     await Task.Delay(checkInterval, sessionCts.Token);
                 }
-                catch
+                catch (OperationCanceledException)
                 {
                     break;
                 }
 
                 if (Environment.TickCount64 - Interlocked.Read(ref lastActivity) >= timeoutMs)
                 {
-                    sessionCts.Cancel();
+                    try
+                    {
+                        sessionCts.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
                     break;
                 }
             }
-        }, sessionCts.Token);
+        });
 
-        var clientToUpstream = RelayDirectionAsync(clientStream, upstreamStream, OnActivity, sessionCts.Token);
-        var upstreamToClient = RelayDirectionAsync(upstreamStream, clientStream, OnActivity, sessionCts.Token);
-
-        var completedFirst = await Task.WhenAny(clientToUpstream, upstreamToClient);
-        if (completedFirst == upstreamToClient)
-            sessionCts.Cancel();
-        else
+        try
         {
+            var clientToUpstream = RelayDirectionAsync(clientStream, upstreamStream, OnActivity, sessionCts.Token);
+            var upstreamToClient = RelayDirectionAsync(upstreamStream, clientStream, OnActivity, sessionCts.Token);
+
+            var completedFirst = await Task.WhenAny(clientToUpstream, upstreamToClient);
+            if (completedFirst == upstreamToClient)
+                sessionCts.Cancel();
+            else
+            {
+                try
+                {
+                    await upstreamToClient;
+                }
+                catch
+                {
+                }
+                sessionCts.Cancel();
+            }
+
             try
             {
-                await upstreamToClient;
+                await Task.WhenAll(clientToUpstream, upstreamToClient);
             }
             catch
             {
             }
-            sessionCts.Cancel();
         }
+        finally
+        {
+            try
+            {
+                sessionCts.Cancel();
+            }
+            catch
+            {
+            }
 
-        try
-        {
-            await Task.WhenAll(clientToUpstream, upstreamToClient);
-        }
-        catch
-        {
+            try
+            {
+                await watchdogTask;
+            }
+            catch
+            {
+            }
         }
     }
 
@@ -846,11 +923,17 @@ public sealed class ProxyServer
 
     private static void ConfigureSocket(Socket socket)
     {
-        socket.NoDelay = true;
-        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
-        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
-        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+        try
+        {
+            socket.NoDelay = true;
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+        }
+        catch
+        {
+        }
     }
 
     private static UpstreamProxy ParseForwardUrl(string forwardUrl)
