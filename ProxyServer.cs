@@ -97,6 +97,8 @@ public sealed class ProxyServer
             using (clientSocket)
             {
                 ConfigureSocket(clientSocket);
+                var localEndPoint = clientSocket.LocalEndPoint as IPEndPoint;
+                var remoteEndPoint = clientSocket.RemoteEndPoint as IPEndPoint;
                 using var rawStream = new NetworkStream(clientSocket, true);
                 using var clientStream = new CountingWriterStream(rawStream);
                 using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -109,7 +111,7 @@ public sealed class ProxyServer
 
                 var firstByte = peekBuffer[0];
                 if (firstByte == 0x05)
-                    await HandleSocks5Async(clientStream, peekBuffer, bytesRead, cancellationToken);
+                    await HandleSocks5Async(clientStream, localEndPoint, remoteEndPoint?.Address, peekBuffer, bytesRead, cancellationToken);
                 else if (firstByte == 0x04)
                 {
                     using var combinedStream = new PrefixedStream(clientStream, peekBuffer, bytesRead, true);
@@ -132,7 +134,7 @@ public sealed class ProxyServer
         }
     }
 
-    private async Task HandleSocks5Async(CountingWriterStream clientStream, byte[] peekBuffer, int bytesRead, CancellationToken cancellationToken)
+    private async Task HandleSocks5Async(CountingWriterStream clientStream, IPEndPoint? localEndPoint, IPAddress? remoteAddress, byte[] peekBuffer, int bytesRead, CancellationToken cancellationToken)
     {
         using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         handshakeCts.CancelAfter(_timeout);
@@ -205,7 +207,7 @@ public sealed class ProxyServer
             await ReadExactAsync(requestStream, header, 4, handshakeCts.Token);
 
             var cmd = header[1];
-            if (cmd != 0x01)
+            if (cmd != 0x01 && cmd != 0x03)
             {
                 await clientStream.WriteAsync(new byte[] { 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, cancellationToken);
                 return;
@@ -244,6 +246,19 @@ public sealed class ProxyServer
             await ReadExactAsync(requestStream, portBuf, 2, handshakeCts.Token);
             var targetPort = BinaryPrimitives.ReadUInt16BigEndian(portBuf);
 
+            if (cmd == 0x03)
+            {
+                if (_upstreamProxy != null && !string.Equals(_upstreamProxy.Scheme, "socks5", StringComparison.OrdinalIgnoreCase))
+                {
+                    await clientStream.WriteAsync(new byte[] { 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, cancellationToken);
+                    LogRequest("SOCKS5-UDP", $"socks5://{targetHost}:{targetPort}", "501", clientStream.BytesWritten);
+                    return;
+                }
+
+                await HandleSocks5UdpAssociateAsync(requestStream, clientStream, localEndPoint, remoteAddress, targetHost, targetPort, cancellationToken);
+                return;
+            }
+
             var url = $"socks5://{targetHost}:{targetPort}";
             Stream? upstreamStream = null;
             try
@@ -273,6 +288,404 @@ public sealed class ProxyServer
         {
             extraStream?.Dispose();
         }
+    }
+
+    private async Task HandleSocks5UdpAssociateAsync(Stream requestStream, CountingWriterStream clientStream, IPEndPoint? localEndPoint, IPAddress? remoteAddress, string targetHost, int targetPort, CancellationToken cancellationToken)
+    {
+        var url = $"socks5://{targetHost}:{targetPort}";
+        Socket? clientUdpSocket = null;
+        Socket? remoteUdpSocket = null;
+        TcpClient? upstreamTcp = null;
+        NetworkStream? upstreamStream = null;
+        long bytesRelayed = 0;
+
+        try
+        {
+            var clientBindIp = NormalizeAddress(localEndPoint?.Address ?? (_bindAddress.Equals(IPAddress.Any) ? IPAddress.Loopback : _bindAddress));
+            clientUdpSocket = new Socket(clientBindIp.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            DisableUdpConnReset(clientUdpSocket);
+            clientUdpSocket.Bind(new IPEndPoint(clientBindIp, 0));
+            var boundEndPoint = (IPEndPoint)clientUdpSocket.LocalEndPoint!;
+
+            IPEndPoint? upstreamRelayEndPoint = null;
+            if (_upstreamProxy != null)
+            {
+                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                connectCts.CancelAfter(_timeout);
+
+                upstreamTcp = new TcpClient();
+                ConfigureSocket(upstreamTcp.Client);
+                await upstreamTcp.ConnectAsync(_upstreamProxy.Host, _upstreamProxy.Port, connectCts.Token);
+                upstreamStream = upstreamTcp.GetStream();
+                upstreamRelayEndPoint = await UpstreamSocks5UdpAssociateAsync(upstreamStream, upstreamTcp.Client, _upstreamProxy, connectCts.Token);
+
+                remoteUdpSocket = new Socket(upstreamRelayEndPoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+                DisableUdpConnReset(remoteUdpSocket);
+                remoteUdpSocket.Bind(new IPEndPoint(upstreamRelayEndPoint.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
+            }
+            else
+                remoteUdpSocket = CreateRemoteUdpSocket();
+
+            await clientStream.WriteAsync(BuildSocks5Reply(0x00, boundEndPoint), cancellationToken);
+
+            using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            long lastActivity = Environment.TickCount64;
+            var timeoutMs = (long)_timeout.TotalMilliseconds;
+            var expectedClientIp = remoteAddress != null ? NormalizeAddress(remoteAddress) : null;
+            IPEndPoint? clientUdpEndPoint = null;
+
+            var checkInterval = (int)Math.Clamp(timeoutMs / 4, 100L, 1000L);
+            var watchdogTask = Task.Run(async () =>
+            {
+                while (!sessionCts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(checkInterval, sessionCts.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+
+                    if (Environment.TickCount64 - Interlocked.Read(ref lastActivity) >= timeoutMs)
+                    {
+                        try
+                        {
+                            sessionCts.Cancel();
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                        }
+                        break;
+                    }
+                }
+            });
+
+            var controlTask = MonitorControlStreamAsync(requestStream, sessionCts);
+            var upstreamControlTask = upstreamStream != null ? MonitorControlStreamAsync(upstreamStream, sessionCts) : Task.CompletedTask;
+
+            var clientReceiveAny = new IPEndPoint(clientUdpSocket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
+            var remoteReceiveAny = new IPEndPoint(remoteUdpSocket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
+
+            var clientToRemoteTask = Task.Run(async () =>
+            {
+                var buffer = new byte[65536];
+                while (!sessionCts.IsCancellationRequested)
+                {
+                    SocketReceiveFromResult result;
+                    try
+                    {
+                        result = await clientUdpSocket.ReceiveFromAsync(buffer, SocketFlags.None, clientReceiveAny, sessionCts.Token);
+                    }
+                    catch
+                    {
+                        break;
+                    }
+
+                    if (result.RemoteEndPoint is not IPEndPoint senderEndPoint)
+                        continue;
+
+                    var senderIp = NormalizeAddress(senderEndPoint.Address);
+                    if (expectedClientIp != null && !senderIp.Equals(expectedClientIp))
+                        continue;
+
+                    if (!TryParseSocks5UdpHeader(buffer.AsSpan(0, result.ReceivedBytes), out var dstHost, out var dstPort, out var payloadOffset))
+                        continue;
+
+                    Volatile.Write(ref clientUdpEndPoint, new IPEndPoint(senderIp, senderEndPoint.Port));
+                    Interlocked.Exchange(ref lastActivity, Environment.TickCount64);
+
+                    var payloadLength = result.ReceivedBytes - payloadOffset;
+                    try
+                    {
+                        if (upstreamRelayEndPoint != null)
+                        {
+                            await remoteUdpSocket.SendToAsync(buffer.AsMemory(0, result.ReceivedBytes), SocketFlags.None, upstreamRelayEndPoint, sessionCts.Token);
+                            Interlocked.Add(ref bytesRelayed, payloadLength);
+                        }
+                        else
+                        {
+                            var targetIp = await ResolveUdpTargetAsync(dstHost, remoteUdpSocket, sessionCts.Token);
+                            if (targetIp == null)
+                                continue;
+
+                            await remoteUdpSocket.SendToAsync(buffer.AsMemory(payloadOffset, payloadLength), SocketFlags.None, new IPEndPoint(targetIp, dstPort), sessionCts.Token);
+                            Interlocked.Add(ref bytesRelayed, payloadLength);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            });
+
+            var remoteToClientTask = Task.Run(async () =>
+            {
+                var buffer = new byte[65536];
+                var sendBuffer = new byte[65536 + 262];
+                while (!sessionCts.IsCancellationRequested)
+                {
+                    SocketReceiveFromResult result;
+                    try
+                    {
+                        result = await remoteUdpSocket.ReceiveFromAsync(buffer, SocketFlags.None, remoteReceiveAny, sessionCts.Token);
+                    }
+                    catch
+                    {
+                        break;
+                    }
+
+                    var targetClient = Volatile.Read(ref clientUdpEndPoint);
+                    if (targetClient == null || result.RemoteEndPoint is not IPEndPoint remoteSender)
+                        continue;
+
+                    Interlocked.Exchange(ref lastActivity, Environment.TickCount64);
+
+                    try
+                    {
+                        if (upstreamRelayEndPoint != null)
+                        {
+                            if (!NormalizeAddress(remoteSender.Address).Equals(NormalizeAddress(upstreamRelayEndPoint.Address)) || remoteSender.Port != upstreamRelayEndPoint.Port)
+                                continue;
+
+                            await clientUdpSocket.SendToAsync(buffer.AsMemory(0, result.ReceivedBytes), SocketFlags.None, targetClient, sessionCts.Token);
+                            Interlocked.Add(ref bytesRelayed, result.ReceivedBytes);
+                        }
+                        else
+                        {
+                            var normalizedSender = new IPEndPoint(NormalizeAddress(remoteSender.Address), remoteSender.Port);
+                            var headerLen = WriteSocks5UdpHeader(sendBuffer, normalizedSender);
+                            if (headerLen + result.ReceivedBytes > sendBuffer.Length)
+                                continue;
+
+                            Buffer.BlockCopy(buffer, 0, sendBuffer, headerLen, result.ReceivedBytes);
+                            await clientUdpSocket.SendToAsync(sendBuffer.AsMemory(0, headerLen + result.ReceivedBytes), SocketFlags.None, targetClient, sessionCts.Token);
+                            Interlocked.Add(ref bytesRelayed, result.ReceivedBytes);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            });
+
+            try
+            {
+                if (upstreamStream != null)
+                    await Task.WhenAny(controlTask, upstreamControlTask, clientToRemoteTask, remoteToClientTask);
+                else
+                    await Task.WhenAny(controlTask, clientToRemoteTask, remoteToClientTask);
+            }
+            finally
+            {
+                try
+                {
+                    sessionCts.Cancel();
+                }
+                catch
+                {
+                }
+
+                clientUdpSocket.Dispose();
+                remoteUdpSocket.Dispose();
+                upstreamStream?.Dispose();
+                upstreamTcp?.Dispose();
+
+                try
+                {
+                    await Task.WhenAll(controlTask, upstreamControlTask, clientToRemoteTask, remoteToClientTask, watchdogTask);
+                }
+                catch
+                {
+                }
+            }
+
+            LogRequest("SOCKS5-UDP", url, "200", Interlocked.Read(ref bytesRelayed));
+        }
+        catch (Exception)
+        {
+            LogRequest("SOCKS5-UDP", url, "503", Interlocked.Read(ref bytesRelayed));
+            try
+            {
+                await clientStream.WriteAsync(new byte[] { 0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, cancellationToken);
+            }
+            catch
+            {
+            }
+        }
+        finally
+        {
+            clientUdpSocket?.Dispose();
+            remoteUdpSocket?.Dispose();
+            upstreamStream?.Dispose();
+            upstreamTcp?.Dispose();
+        }
+    }
+
+    private static async Task MonitorControlStreamAsync(Stream stream, CancellationTokenSource sessionCts)
+    {
+        var buffer = new byte[64];
+        try
+        {
+            while (!sessionCts.IsCancellationRequested)
+            {
+                var read = await stream.ReadAsync(buffer, sessionCts.Token);
+                if (read <= 0)
+                    break;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            sessionCts.Cancel();
+        }
+        catch
+        {
+        }
+    }
+
+    private static Socket CreateRemoteUdpSocket()
+    {
+        try
+        {
+            var dualSocket = new Socket(AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp);
+            dualSocket.DualMode = true;
+            DisableUdpConnReset(dualSocket);
+            dualSocket.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
+            return dualSocket;
+        }
+        catch (SocketException)
+        {
+            var ipv4Socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            DisableUdpConnReset(ipv4Socket);
+            ipv4Socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+            return ipv4Socket;
+        }
+    }
+
+    private static void DisableUdpConnReset(Socket socket)
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            const int sioUdpConnReset = -1744830452;
+            socket.IOControl((IOControlCode)sioUdpConnReset, new byte[4], null);
+        }
+        catch
+        {
+        }
+    }
+
+    private static IPAddress NormalizeAddress(IPAddress address) =>
+        address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+
+    private static byte[] BuildSocks5Reply(byte replyCode, IPEndPoint endPoint)
+    {
+        var address = NormalizeAddress(endPoint.Address);
+        var addrBytes = address.GetAddressBytes();
+        var atyp = (byte)(address.AddressFamily == AddressFamily.InterNetworkV6 ? 0x04 : 0x01);
+        var reply = new byte[4 + addrBytes.Length + 2];
+        reply[0] = 0x05;
+        reply[1] = replyCode;
+        reply[2] = 0x00;
+        reply[3] = atyp;
+        Buffer.BlockCopy(addrBytes, 0, reply, 4, addrBytes.Length);
+        BinaryPrimitives.WriteUInt16BigEndian(reply.AsSpan(4 + addrBytes.Length, 2), (ushort)endPoint.Port);
+        return reply;
+    }
+
+    private static bool TryParseSocks5UdpHeader(ReadOnlySpan<byte> datagram, out string host, out int port, out int payloadOffset)
+    {
+        host = string.Empty;
+        port = 0;
+        payloadOffset = 0;
+
+        if (datagram.Length < 10)
+            return false;
+
+        if (datagram[0] != 0x00 || datagram[1] != 0x00 || datagram[2] != 0x00)
+            return false;
+
+        var atyp = datagram[3];
+        var offset = 4;
+        if (atyp == 0x01)
+        {
+            if (datagram.Length < offset + 4 + 2)
+                return false;
+            host = new IPAddress(datagram.Slice(offset, 4)).ToString();
+            offset += 4;
+        }
+        else if (atyp == 0x03)
+        {
+            if (datagram.Length < offset + 1)
+                return false;
+            var len = datagram[offset++];
+            if (len == 0 || datagram.Length < offset + len + 2)
+                return false;
+            host = Encoding.ASCII.GetString(datagram.Slice(offset, len));
+            offset += len;
+        }
+        else if (atyp == 0x04)
+        {
+            if (datagram.Length < offset + 16 + 2)
+                return false;
+            host = new IPAddress(datagram.Slice(offset, 16)).ToString();
+            offset += 16;
+        }
+        else
+            return false;
+
+        port = BinaryPrimitives.ReadUInt16BigEndian(datagram.Slice(offset, 2));
+        payloadOffset = offset + 2;
+        return port > 0;
+    }
+
+    private static int WriteSocks5UdpHeader(byte[] buffer, IPEndPoint sourceEndPoint)
+    {
+        var address = NormalizeAddress(sourceEndPoint.Address);
+        var addrBytes = address.GetAddressBytes();
+        buffer[0] = 0x00;
+        buffer[1] = 0x00;
+        buffer[2] = 0x00;
+        buffer[3] = (byte)(address.AddressFamily == AddressFamily.InterNetworkV6 ? 0x04 : 0x01);
+        Buffer.BlockCopy(addrBytes, 0, buffer, 4, addrBytes.Length);
+        BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(4 + addrBytes.Length, 2), (ushort)sourceEndPoint.Port);
+        return 4 + addrBytes.Length + 2;
+    }
+
+    private static async Task<IPAddress?> ResolveUdpTargetAsync(string host, Socket remoteUdpSocket, CancellationToken cancellationToken)
+    {
+        if (IPAddress.TryParse(host, out var parsedIp))
+        {
+            var normalized = NormalizeAddress(parsedIp);
+            if (remoteUdpSocket.AddressFamily == AddressFamily.InterNetworkV6 && normalized.AddressFamily == AddressFamily.InterNetwork)
+                return remoteUdpSocket.DualMode ? normalized.MapToIPv6() : null;
+            if (remoteUdpSocket.AddressFamily != normalized.AddressFamily)
+                return null;
+            return normalized;
+        }
+
+        var addresses = await Dns.GetHostAddressesAsync(host, cancellationToken);
+        for (var i = 0; i < addresses.Length; i++)
+        {
+            var normalized = NormalizeAddress(addresses[i]);
+            if (remoteUdpSocket.AddressFamily == AddressFamily.InterNetworkV6 && normalized.AddressFamily == AddressFamily.InterNetwork)
+            {
+                if (remoteUdpSocket.DualMode)
+                    return normalized.MapToIPv6();
+                continue;
+            }
+            if (remoteUdpSocket.AddressFamily == normalized.AddressFamily)
+                return normalized;
+        }
+
+        return null;
     }
 
     private async Task HandleSocks4Async(Stream inputCombinedStream, CountingWriterStream clientStream, CancellationToken cancellationToken)
@@ -602,7 +1015,7 @@ public sealed class ProxyServer
         }
     }
 
-    private static async Task<Stream> UpstreamSocks5ConnectAsync(Stream stream, UpstreamProxy proxy, string targetHost, int targetPort, CancellationToken cancellationToken)
+    private static async Task UpstreamSocks5NegotiateAsync(Stream stream, UpstreamProxy proxy, CancellationToken cancellationToken)
     {
         var hasAuth = !string.IsNullOrEmpty(proxy.Username);
         if (hasAuth)
@@ -632,6 +1045,11 @@ public sealed class ProxyServer
         }
         else if (methodResponse[1] != 0x00)
             throw new InvalidOperationException("SOCKS5 upstream unsupported authentication method.");
+    }
+
+    private static async Task<Stream> UpstreamSocks5ConnectAsync(Stream stream, UpstreamProxy proxy, string targetHost, int targetPort, CancellationToken cancellationToken)
+    {
+        await UpstreamSocks5NegotiateAsync(stream, proxy, cancellationToken);
 
         var hostBytes = Encoding.ASCII.GetBytes(targetHost);
         var request = new byte[7 + hostBytes.Length];
@@ -669,6 +1087,58 @@ public sealed class ProxyServer
         }
 
         return stream;
+    }
+
+    private static async Task<IPEndPoint> UpstreamSocks5UdpAssociateAsync(Stream stream, Socket upstreamSocket, UpstreamProxy proxy, CancellationToken cancellationToken)
+    {
+        await UpstreamSocks5NegotiateAsync(stream, proxy, cancellationToken);
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, cancellationToken);
+
+        var respHeader = new byte[4];
+        await ReadExactAsync(stream, respHeader, 4, cancellationToken);
+        if (respHeader[1] != 0x00)
+            throw new InvalidOperationException($"SOCKS5 upstream UDP associate failed: {respHeader[1]}.");
+
+        IPAddress relayIp;
+        var atyp = respHeader[3];
+        if (atyp == 0x01)
+        {
+            var ipBuf = new byte[4];
+            await ReadExactAsync(stream, ipBuf, 4, cancellationToken);
+            relayIp = new IPAddress(ipBuf);
+        }
+        else if (atyp == 0x03)
+        {
+            var lenBuf = new byte[1];
+            await ReadExactAsync(stream, lenBuf, 1, cancellationToken);
+            var domainBuf = new byte[lenBuf[0]];
+            await ReadExactAsync(stream, domainBuf, lenBuf[0], cancellationToken);
+            var host = Encoding.ASCII.GetString(domainBuf);
+            var addresses = await Dns.GetHostAddressesAsync(host, cancellationToken);
+            relayIp = addresses[0];
+        }
+        else if (atyp == 0x04)
+        {
+            var ipBuf = new byte[16];
+            await ReadExactAsync(stream, ipBuf, 16, cancellationToken);
+            relayIp = new IPAddress(ipBuf);
+        }
+        else
+            throw new InvalidOperationException($"SOCKS5 upstream unsupported address type: {atyp}.");
+
+        var portBuf = new byte[2];
+        await ReadExactAsync(stream, portBuf, 2, cancellationToken);
+        var relayPort = BinaryPrimitives.ReadUInt16BigEndian(portBuf);
+
+        relayIp = NormalizeAddress(relayIp);
+        if (relayIp.Equals(IPAddress.Any) || relayIp.Equals(IPAddress.IPv6Any))
+        {
+            if (upstreamSocket.RemoteEndPoint is IPEndPoint remoteEp)
+                relayIp = NormalizeAddress(remoteEp.Address);
+        }
+
+        return new IPEndPoint(relayIp, relayPort);
     }
 
     private static async Task<Stream> UpstreamSocks4ConnectAsync(Stream stream, string targetHost, int targetPort, CancellationToken cancellationToken)
